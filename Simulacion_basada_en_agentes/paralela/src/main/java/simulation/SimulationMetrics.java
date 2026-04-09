@@ -70,10 +70,9 @@ public class SimulationMetrics {
             " Vehículos detenidos: %d (%.2f%%)\n" +
             " Vehículos en movimiento: %d\n" +
             " Flujo promedio: %.2f\n" +
-            " Movimientos totales: %d\n" +
-            " Tiempo de ejecución: %d ms",
+            " Movimientos totales: %d\n",
             totalVehicles, stoppedVehicles, getStopPercentage(),
-            movingVehicles, getAverageFlow(), totalMoves, executionTimeMs
+            movingVehicles, getAverageFlow(), totalMoves
         );
     }
 }

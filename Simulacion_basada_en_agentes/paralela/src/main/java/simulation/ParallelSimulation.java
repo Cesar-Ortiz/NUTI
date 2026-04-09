@@ -5,430 +5,330 @@ import model.*;
 import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Simulación paralela de tráfico urbano basada en agentes
- * Estrategia: Paralelización por agentes
- * Los vehículos se distribuyen entre hilos para actualización concurrente
+ * Simulación paralela de tráfico urbano basada en agentes.
+ *
+ * Estrategia: 4 cuadrantes geográficos (NW=0, NE=1, SW=2, SE=3).
+ * Cada hilo es dueño de un cuadrante
  */
 public class ParallelSimulation {
+
+    public static final int NUM_THREADS = 4;
+
     private final Grid grid;
     private final List<Vehicle> vehicles;
     private final Map<Position, TrafficLight> trafficLights;
-    private final Map<Position, List<Vehicle>> occupancy;
+    private final ConcurrentHashMap<Position, List<Vehicle>> occupancy;
+
+    @SuppressWarnings("unchecked")
+    private final List<Vehicle>[] quadrantVehicles = new List[NUM_THREADS];
+
+    
+    private ConcurrentHashMap<Vehicle, Position>  plannedMoves;
+    private ConcurrentHashMap<Vehicle, Direction> plannedDirections;
+    private ConcurrentHashMap<Vehicle, Boolean>   stoppedFlags;
+
+    // Agrupación por destino — construida por el hilo principal entre fases
+    // Position → (Direction → lista de vehículos que van ahí en esa dirección)
+    private Map<Position, Map<Direction, List<Vehicle>>> byDestination;
+
+    private final AtomicInteger atomicStopped    = new AtomicInteger(0);
+    private final AtomicInteger atomicTotalMoves = new AtomicInteger(0);
+
     private final SimulationMetrics metrics;
-    private final Random random;
-    
+
     // Paralelización
-    private final int numThreads;
-    private final ExecutorService executorService;
-    private final ReentrantLock occupancyLock = new ReentrantLock();
-    
-    // Parámetros de simulación
-    private final int trafficLightCycleDuration;
+    private final ExecutorService executor;
+    private final CyclicBarrier barrier1;
+    private final CyclicBarrier barrier2;
+
+    private final int midX;
+    private final int midY;
+    private final int    trafficLightCycleDuration;
     private final double directionChangeProb;
-    private final int maxVehiclesPerCell = 2;
-    
-    /**
-     * Constructor de la simulación paralela
-     * 
-     * @param gridFilePath Ruta al archivo de configuración de la rejilla
-     * @param numVehicles Número de vehículos a simular
-     * @param trafficLightCycleDuration Duración del ciclo de semáforos
-     * @param directionChangeProb Probabilidad de cambio de dirección
-     * @param numThreads Número de hilos para paralelización
-     */
-    public ParallelSimulation(String gridFilePath, int numVehicles, 
-                              int trafficLightCycleDuration, double directionChangeProb,
-                              int numThreads) throws IOException {
-        this.grid = new Grid(gridFilePath);
-        this.vehicles = new ArrayList<>();
-        this.trafficLights = new HashMap<>();
-        this.occupancy = new ConcurrentHashMap<>();
-        this.metrics = new SimulationMetrics();
-        this.random = new Random();
+
+    // Constructor
+    public ParallelSimulation(String gridFilePath, int numVehicles,
+                              int trafficLightCycleDuration,
+                              double directionChangeProb) throws IOException {
+        this.grid                      = new Grid(gridFilePath);
+        this.vehicles                  = new ArrayList<>();
+        this.trafficLights             = new HashMap<>();
+        this.occupancy                 = new ConcurrentHashMap<>();
+        this.metrics                   = new SimulationMetrics();
         this.trafficLightCycleDuration = trafficLightCycleDuration;
-        this.directionChangeProb = directionChangeProb;
-        this.numThreads = numThreads;
-        this.executorService = Executors.newFixedThreadPool(numThreads);
-        
+        this.directionChangeProb       = directionChangeProb;
+
+        this.midX = grid.getWidth()  / 2;
+        this.midY = grid.getHeight() / 2;
+
+        this.executor = Executors.newFixedThreadPool(NUM_THREADS);
+
+        this.barrier1 = new CyclicBarrier(NUM_THREADS, this::buildByDestination);
+        this.barrier2 = new CyclicBarrier(NUM_THREADS);
+
+        for (int i = 0; i < NUM_THREADS; i++) quadrantVehicles[i] = new ArrayList<>();
+
         initializeTrafficLights();
         initializeVehicles(numVehicles);
     }
-    
-    /**
-     * Inicializa los semáforos en todas las intersecciones
-     */
+
+    // Inicialización
+
     private void initializeTrafficLights() {
-        for (Position intersection : grid.getIntersections()) {
-            trafficLights.put(intersection, new TrafficLight(intersection, trafficLightCycleDuration));
-        }
+        for (Position p : grid.getIntersections())
+            trafficLights.put(p, new TrafficLight(p, trafficLightCycleDuration));
     }
-    
-    /**
-     * Inicializa los vehículos en posiciones aleatorias
-     */
+
     private void initializeVehicles(int numVehicles) {
-        List<Position> traversablePositions = grid.getTraversablePositions();
-        
-        if (traversablePositions.isEmpty()) {
+        List<Position> traversable = grid.getTraversablePositions();
+        if (traversable.isEmpty())
             throw new IllegalStateException("No hay posiciones transitables en la rejilla");
-        }
-        
-        Direction[] directions = Direction.values();
-        
+
+        Random rng = new Random();
+        Direction[] dirs = Direction.values();
         for (int i = 0; i < numVehicles; i++) {
-            Position pos = traversablePositions.get(random.nextInt(traversablePositions.size()));
-            Direction dir = directions[random.nextInt(directions.length)];
-            Vehicle vehicle = new Vehicle(pos, dir);
-            vehicles.add(vehicle);
-            
-            occupancy.computeIfAbsent(pos, k -> new CopyOnWriteArrayList<>()).add(vehicle);
+            Position pos = traversable.get(rng.nextInt(traversable.size()));
+            Direction dir = dirs[rng.nextInt(dirs.length)];
+            Vehicle v = new Vehicle(pos, dir);
+            vehicles.add(v);
+            occupancy.computeIfAbsent(pos, k -> new CopyOnWriteArrayList<>()).add(v);
         }
     }
-    
-    /**
-     * Ejecuta un paso de tiempo de la simulación
-     */
+
+    // Cuadrantes
+
+    private int quadrantOf(Position pos) {
+        boolean west  = pos.getX() < midX;
+        boolean north = pos.getY() < midY;
+        if (north && west) return 0; // NW
+        if (north)         return 1; // NE
+        if (west)          return 2; // SW
+        return                    3; // SE
+    }
+
+
+    private void buildByDestination() {
+        Map<Position, Map<Direction, List<Vehicle>>> map = new HashMap<>();
+        for (Map.Entry<Vehicle, Position> e : plannedMoves.entrySet()) {
+            Vehicle v   = e.getKey();
+            Position dest = e.getValue();
+            Direction d = plannedDirections.get(v);
+            map.computeIfAbsent(dest, k -> new HashMap<>())
+               .computeIfAbsent(d, k -> new ArrayList<>())
+               .add(v);
+        }
+        byDestination = map; // visible a todos los hilos
+    }
+
+    // Paso de simulación
+
     public void step() throws InterruptedException, ExecutionException {
-        // 1. Actualizar semáforos (secuencial, es rápido)
-        updateTrafficLights();
-        
-        // 2. Actualizar vehículos (PARALELO)
-        updateVehiclesParallel();
-        
-        // 3. Actualizar métricas
-        updateMetrics();
-    }
-    
-    /**
-     * Actualiza el estado de todos los semáforos
-     */
-    private void updateTrafficLights() {
-        for (TrafficLight light : trafficLights.values()) {
-            light.update();
-        }
-    }
-    
-    /**
-     * Actualiza el estado de todos los vehículos en PARALELO
-     */
-    private void updateVehiclesParallel() throws InterruptedException, ExecutionException {
-        // Limpiar ocupación anterior
+        // Semáforos: secuencial, O(intersecciones), muy rápido
+        for (TrafficLight tl : trafficLights.values()) tl.update();
+
+        // Reasignar vehículos a cuadrantes (O(n) secuencial, una sola pasada)
+        for (int i = 0; i < NUM_THREADS; i++) quadrantVehicles[i] = new ArrayList<>();
+        for (Vehicle v : vehicles) quadrantVehicles[quadrantOf(v.getPosition())].add(v);
+
+        // Reiniciar estructuras compartidas
+        plannedMoves      = new ConcurrentHashMap<>();
+        plannedDirections = new ConcurrentHashMap<>();
+        stoppedFlags      = new ConcurrentHashMap<>();
         occupancy.clear();
-        
-        // Estructuras compartidas para movimientos
-        ConcurrentHashMap<Vehicle, Position> plannedMoves = new ConcurrentHashMap<>();
-        ConcurrentHashMap<Vehicle, Direction> plannedDirections = new ConcurrentHashMap<>();
-        ConcurrentHashMap<Vehicle, Position> stoppedVehicles = new ConcurrentHashMap<>();
-        
-        // Dividir vehículos entre hilos
-        int vehiclesPerThread = (int) Math.ceil((double) vehicles.size() / numThreads);
-        List<Future<?>> futures = new ArrayList<>();
-        
-        for (int t = 0; t < numThreads; t++) {
-            final int threadId = t;
-            final int startIdx = threadId * vehiclesPerThread;
-            final int endIdx = Math.min(startIdx + vehiclesPerThread, vehicles.size());
-            
-            if (startIdx >= vehicles.size()) break;
-            
-            Future<?> future = executorService.submit(() -> {
-                planMovementsForVehicles(startIdx, endIdx, plannedMoves, plannedDirections, stoppedVehicles);
-            });
-            
-            futures.add(future);
+        atomicStopped.set(0);
+        atomicTotalMoves.set(0);
+
+        // Lanzar los 4 hilos de cuadrante
+        List<Future<?>> futures = new ArrayList<>(NUM_THREADS);
+        for (int q = 0; q < NUM_THREADS; q++) {
+            final int quadrant = q;
+            futures.add(executor.submit(() -> runQuadrantWorker(quadrant)));
         }
-        
-        // Esperar a que todos los hilos terminen
-        for (Future<?> future : futures) {
-            future.get();
-        }
-        
-        // Evitar condiciones de carrera
-        resolveConflictsAndExecuteMoves(plannedMoves, plannedDirections, stoppedVehicles);
+        for (Future<?> f : futures) f.get();
+
+        metrics.update(vehicles.size(), atomicStopped.get(), atomicTotalMoves.get());
     }
-    
-    /**
-     * Movimientos para un grupo de vehículos
-     */
-    private void planMovementsForVehicles(int startIdx, int endIdx,
-                                          ConcurrentHashMap<Vehicle, Position> plannedMoves,
-                                          ConcurrentHashMap<Vehicle, Direction> plannedDirections,
-                                          ConcurrentHashMap<Vehicle, Position> stoppedVehicles) {
-        Random threadRandom = new Random();
-        
-        for (int i = startIdx; i < endIdx; i++) {
-            Vehicle vehicle = vehicles.get(i);
-            Position currentPos = vehicle.getPosition();
-            Direction currentDir = vehicle.getDirection();
-            Position nextPos = vehicle.getNextPosition();
-            boolean foundValidMove = false;
-            Direction chosenDir = currentDir;
-            
-            // Verificar si puede avanzar en su dirección actual
-            if (grid.isTraversable(nextPos)) {
-                if (grid.isIntersection(currentPos)) {
-                    TrafficLight light = trafficLights.get(currentPos);
-                    if (light != null && !light.canPass(currentDir)) {
-                        // Semáforo en rojo, intentar girar
-                        Direction[] perp = currentDir.perpendiculars();
-                        for (Direction testDir : perp) {
-                            if (light.canPass(testDir)) {
-                                Position testPos = currentPos.move(testDir);
-                                if (grid.isTraversable(testPos)) {
-                                    nextPos = testPos;
-                                    chosenDir = testDir;
-                                    foundValidMove = true;
-                                    break;
-                                }
-                            }
-                        }
-                    } else {
-                        foundValidMove = true;
-                        if (threadRandom.nextDouble() < directionChangeProb) {
-                            Direction[] perp = currentDir.perpendiculars();
-                            if (perp.length > 0) {
-                                Direction newDir = perp[threadRandom.nextInt(perp.length)];
-                                Position testPos = currentPos.move(newDir);
-                                if (grid.isTraversable(testPos)) {
-                                    nextPos = testPos;
-                                    chosenDir = newDir;
-                                }
+
+
+    private void runQuadrantWorker(int quadrant) {
+        try {
+            Random rng = new Random();
+
+            for (Vehicle v : quadrantVehicles[quadrant]) {
+                planVehicle(v, rng);
+            }
+
+            barrier1.await();
+
+            for (Map.Entry<Position, Map<Direction, List<Vehicle>>> entry
+                    : byDestination.entrySet()) {
+                Position dest = entry.getKey();
+                if (quadrantOf(dest) != quadrant) continue;
+                resolveDestination(dest, entry.getValue());
+            }
+            for (Map.Entry<Vehicle, Boolean> entry : stoppedFlags.entrySet()) {
+                Vehicle v = entry.getKey();
+                if (quadrantOf(v.getPosition()) != quadrant) continue;
+                v.stop();
+                occupancy.computeIfAbsent(v.getPosition(),
+                        k -> new CopyOnWriteArrayList<>()).add(v);
+            }
+
+            barrier2.await();
+
+            int localStopped = 0;
+            int localMoves   = 0;
+            // ya se movieron a nuevas posiciones; iteramos vehicles completo
+            // pero dividido por índice para evitar solapamiento
+            int chunk = (int) Math.ceil((double) vehicles.size() / NUM_THREADS);
+            int from  = quadrant * chunk;
+            int to    = Math.min(from + chunk, vehicles.size());
+            for (int i = from; i < to; i++) {
+                Vehicle v = vehicles.get(i);
+                if (v.isStopped()) localStopped++;
+                localMoves += v.getTotalMoves();
+            }
+            atomicStopped.addAndGet(localStopped);
+            atomicTotalMoves.addAndGet(localMoves);
+
+        } catch (InterruptedException | BrokenBarrierException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void planVehicle(Vehicle v, Random rng) {
+        Position currentPos = v.getPosition();
+        Direction currentDir = v.getDirection();
+        Position nextPos    = v.getNextPosition();
+        Direction chosenDir = currentDir;
+        boolean canMove     = false;
+
+        if (grid.isTraversable(nextPos)) {
+            if (grid.isIntersection(currentPos)) {
+                TrafficLight tl = trafficLights.get(currentPos);
+                if (tl != null && !tl.canPass(currentDir)) {
+                    for (Direction d : currentDir.perpendiculars()) {
+                        if (tl.canPass(d)) {
+                            Position tp = currentPos.move(d);
+                            if (grid.isTraversable(tp)) {
+                                nextPos = tp; chosenDir = d; canMove = true; break;
                             }
                         }
                     }
                 } else {
-                    foundValidMove = true;
-                }
-            }
-            
-            // Si no puede moverse, intentar alternativas
-            if (!foundValidMove) {
-                if (grid.isIntersection(currentPos)) {
-                    TrafficLight light = trafficLights.get(currentPos);
-                    Direction[] allDirs = Direction.values();
-                    List<Direction> dirList = new ArrayList<>(Arrays.asList(allDirs));
-                    Collections.shuffle(dirList, threadRandom);
-                    
-                    for (Direction testDir : dirList) {
-                        if (testDir == currentDir.opposite()) continue;
-                        
-                        if (light == null || light.canPass(testDir)) {
-                            Position testPos = currentPos.move(testDir);
-                            if (grid.isTraversable(testPos)) {
-                                nextPos = testPos;
-                                chosenDir = testDir;
-                                foundValidMove = true;
-                                break;
-                            }
-                        }
-                    }
-                    
-                    if (!foundValidMove) {
-                        Direction reverseDir = currentDir.opposite();
-                        if (light == null || light.canPass(reverseDir)) {
-                            Position reversePos = currentPos.move(reverseDir);
-                            if (grid.isTraversable(reversePos)) {
-                                nextPos = reversePos;
-                                chosenDir = reverseDir;
-                                foundValidMove = true;
-                            }
+                    canMove = true;
+                    if (rng.nextDouble() < directionChangeProb) {
+                        Direction[] perp = currentDir.perpendiculars();
+                        if (perp.length > 0) {
+                            Direction nd = perp[rng.nextInt(perp.length)];
+                            Position tp = currentPos.move(nd);
+                            if (grid.isTraversable(tp)) { nextPos = tp; chosenDir = nd; }
                         }
                     }
                 }
-            }
-            
-            if (foundValidMove) {
-                plannedMoves.put(vehicle, nextPos);
-                plannedDirections.put(vehicle, chosenDir);
             } else {
-                stoppedVehicles.put(vehicle, currentPos);
+                canMove = true;
             }
         }
-    }
-    
-    /**
-     * Evitar condiciones de carrera
-     */
-    private void resolveConflictsAndExecuteMoves(ConcurrentHashMap<Vehicle, Position> plannedMoves,
-                                                 ConcurrentHashMap<Vehicle, Direction> plannedDirections,
-                                                 ConcurrentHashMap<Vehicle, Position> stoppedVehicles) {
-        // Primero, procesar vehículos detenidos
-        for (Map.Entry<Vehicle, Position> entry : stoppedVehicles.entrySet()) {
-            Vehicle vehicle = entry.getKey();
-            Position pos = entry.getValue();
-            vehicle.stop();
-            occupancy.computeIfAbsent(pos, k -> new CopyOnWriteArrayList<>()).add(vehicle);
-        }
-        
-        // Agrupar vehículos por destino y dirección
-        Map<Position, Map<Direction, List<Vehicle>>> vehiclesByTargetAndDir = new HashMap<>();
-        
-        for (Map.Entry<Vehicle, Position> entry : plannedMoves.entrySet()) {
-            Vehicle vehicle = entry.getKey();
-            Position target = entry.getValue();
-            Direction dir = plannedDirections.get(vehicle);
-            
-            vehiclesByTargetAndDir.computeIfAbsent(target, k -> new HashMap<>());
-            vehiclesByTargetAndDir.get(target).computeIfAbsent(dir, k -> new ArrayList<>()).add(vehicle);
-        }
-        
-        // Ejecutar movimientos respetando bidireccionalidad
-        for (Map.Entry<Position, Map<Direction, List<Vehicle>>> posEntry : vehiclesByTargetAndDir.entrySet()) {
-            Position targetPos = posEntry.getKey();
-            Map<Direction, List<Vehicle>> dirMap = posEntry.getValue();
-            
-            for (Map.Entry<Direction, List<Vehicle>> dirEntry : dirMap.entrySet()) {
-                Direction dir = dirEntry.getKey();
-                List<Vehicle> vehiclesInDir = dirEntry.getValue();
-                
-                int allowedInDir = 1;
-                
-                for (int i = 0; i < Math.min(vehiclesInDir.size(), allowedInDir); i++) {
-                    Vehicle vehicle = vehiclesInDir.get(i);
-                    Direction newDir = plannedDirections.get(vehicle);
-                    
-                    if (newDir != vehicle.getDirection()) {
-                        vehicle.setDirection(newDir);
+
+        if (!canMove && grid.isIntersection(currentPos)) {
+            TrafficLight tl = trafficLights.get(currentPos);
+            List<Direction> dirList = new ArrayList<>(Arrays.asList(Direction.values()));
+            Collections.shuffle(dirList, rng);
+            for (Direction d : dirList) {
+                if (d == currentDir.opposite()) continue;
+                if (tl == null || tl.canPass(d)) {
+                    Position tp = currentPos.move(d);
+                    if (grid.isTraversable(tp)) {
+                        nextPos = tp; chosenDir = d; canMove = true; break;
                     }
-                    
-                    vehicle.move(targetPos);
-                    occupancy.computeIfAbsent(targetPos, k -> new CopyOnWriteArrayList<>()).add(vehicle);
                 }
-                
-                for (int i = allowedInDir; i < vehiclesInDir.size(); i++) {
-                    Vehicle vehicle = vehiclesInDir.get(i);
-                    vehicle.stop();
-                    Position currentPos = vehicle.getPosition();
-                    occupancy.computeIfAbsent(currentPos, k -> new CopyOnWriteArrayList<>()).add(vehicle);
+            }
+            if (!canMove) {
+                Direction rev = currentDir.opposite();
+                if (tl == null || tl.canPass(rev)) {
+                    Position rp = currentPos.move(rev);
+                    if (grid.isTraversable(rp)) {
+                        nextPos = rp; chosenDir = rev; canMove = true;
+                    }
                 }
             }
         }
-    }
-    
-    /**
-     * Actualiza las métricas de la simulación
-     */
-    private void updateMetrics() {
-        int stopped = 0;
-        int totalMoves = 0;
-        
-        for (Vehicle vehicle : vehicles) {
-            if (vehicle.isStopped()) {
-                stopped++;
-            }
-            totalMoves += vehicle.getTotalMoves();
+
+        if (canMove) {
+            plannedMoves.put(v, nextPos);
+            plannedDirections.put(v, chosenDir);
+        } else {
+            stoppedFlags.put(v, Boolean.TRUE);
         }
-        
-        metrics.update(vehicles.size(), stopped, totalMoves);
     }
-    
-    /**
-     * Ejecuta la simulación por un número de pasos
-     */
+
+    private void resolveDestination(Position dest,
+                                    Map<Direction, List<Vehicle>> byDir) {
+        for (Map.Entry<Direction, List<Vehicle>> de : byDir.entrySet()) {
+            List<Vehicle> list = de.getValue();
+            Vehicle winner = list.get(0);
+            Direction nd = plannedDirections.get(winner);
+            if (nd != winner.getDirection()) winner.setDirection(nd);
+            winner.move(dest);
+            occupancy.computeIfAbsent(dest, k -> new CopyOnWriteArrayList<>()).add(winner);
+
+            for (int i = 1; i < list.size(); i++) {
+                Vehicle loser = list.get(i);
+                loser.stop();
+                occupancy.computeIfAbsent(loser.getPosition(),
+                        k -> new CopyOnWriteArrayList<>()).add(loser);
+            }
+        }
+    }
+
+
     public void run(int steps) throws InterruptedException, ExecutionException {
-        long startTime = System.currentTimeMillis();
-        
-        for (int i = 0; i < steps; i++) {
-            step();
-        }
-        
-        long endTime = System.currentTimeMillis();
-        metrics.setExecutionTime(endTime - startTime);
+        long t0 = System.currentTimeMillis();
+        for (int i = 0; i < steps; i++) step();
+        metrics.setExecutionTime(System.currentTimeMillis() - t0);
     }
-    
-    /**
-     * Ejecuta la simulación con visualización en consola
-     */
-    public void runWithVisualization(int steps, int visualizationInterval) 
+
+    public void runWithVisualization(int steps, int interval)
             throws InterruptedException, ExecutionException {
-        long startTime = System.currentTimeMillis();
-        
-        System.out.println("\n=== INICIANDO SIMULACIÓN PARALELA ===");
-        System.out.println("Hilos: " + numThreads);
-        System.out.println();
-        
+        System.out.println("\n=== INICIANDO SIMULACION PARALELA ===\n");
+        long t0 = System.currentTimeMillis();
         for (int i = 0; i < steps; i++) {
             step();
-            
-            if (i % visualizationInterval == 0) {
-                System.out.println("\n------- Paso " + i + " -------");
-                printSimulationState();
+            if (i % interval == 0) {
+                System.out.println("------- Paso " + i + " -------");
+                System.out.println(metrics);
+                System.out.println();
             }
         }
-        
-        long endTime = System.currentTimeMillis();
-        metrics.setExecutionTime(endTime - startTime);
-        
+        metrics.setExecutionTime(System.currentTimeMillis() - t0);
         System.out.println("\n=== SIMULACIÓN COMPLETADA ===");
         printFinalMetrics();
     }
-    
-    /**
-     * Imprime el estado actual de la simulación
-     */
-    private void printSimulationState() {
-        char[][] display = new char[grid.getHeight()][grid.getWidth()];
-        
-        for (int y = 0; y < grid.getHeight(); y++) {
-            for (int x = 0; x < grid.getWidth(); x++) {
-                Position pos = new Position(x, y);
-                display[y][x] = grid.getCellType(pos).getSymbol();
-            }
-        }
-        
-        for (Vehicle vehicle : vehicles) {
-            Position pos = vehicle.getPosition();
-            if (grid.isValidPosition(pos)) {
-                char symbol = vehicle.isStopped() ? 'X' : 'V';
-                display[pos.getY()][pos.getX()] = symbol;
-            }
-        }
-        
-        System.out.println(metrics);
-    }
-    
-    /**
-     * Imprime métricas finales
-     */
+
     private void printFinalMetrics() {
         System.out.println("\n" + metrics);
         System.out.println("\nDetalles de rendimiento:");
-        System.out.println("  Hilos utilizados: " + numThreads);
-        System.out.println("  Throughput: " + 
-            String.format("%.2f", (double) metrics.getTotalMoves() / (metrics.getExecutionTimeMs() / 1000.0)) + 
-            " movimientos/segundo");
+        System.out.println("  Hilos (cuadrantes): " + NUM_THREADS);
+        System.out.printf("  Throughput: %.2f movimientos/segundo%n",
+                (double) metrics.getTotalMoves() / (metrics.getExecutionTimeMs() / 1000.0));
     }
-    
-    /**
-     * Cierra el ExecutorService
-     */
+
     public void shutdown() {
-        executorService.shutdown();
+        executor.shutdown();
         try {
-            if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
-                executorService.shutdownNow();
-            }
+            if (!executor.awaitTermination(5, TimeUnit.SECONDS))
+                executor.shutdownNow();
         } catch (InterruptedException e) {
-            executorService.shutdownNow();
+            executor.shutdownNow();
         }
     }
-    
-    public SimulationMetrics getMetrics() {
-        return metrics;
-    }
-    
-    public Grid getGrid() {
-        return grid;
-    }
-    
-    public List<Vehicle> getVehicles() {
-        return vehicles;
-    }
-    
-    public int getNumThreads() {
-        return numThreads;
-    }
+
+    public SimulationMetrics getMetrics()   { return metrics; }
+    public Grid              getGrid()      { return grid; }
+    public List<Vehicle>     getVehicles()  { return vehicles; }
+    public int               getNumThreads(){ return NUM_THREADS; }
 }

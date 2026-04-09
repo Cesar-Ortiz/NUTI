@@ -3,63 +3,49 @@ import simulation.ParallelSimulation;
 import java.io.IOException;
 
 /**
- * Clase principal para ejecutar la simulación paralela de tráfico urbano
+ * Clase principal para ejecutar la simulación paralela de tráfico urbano.
+ * La versión paralela usa 4 hilos, uno por cuadrante geográfico (NW, NE, SW, SE).
  */
 public class Main {
     public static void main(String[] args) {
-        // Parámetros de configuración
-        String gridFile = "grid.txt";
-        int numVehicles = 50000;
-        int simulationSteps = 100;
-        int trafficLightCycle = 10;
+        String gridFile            = "grid.txt";
+        int    numVehicles         = 2000;
+        int    simulationSteps     = 200;
+        int    trafficLightCycle   = 10;
         double directionChangeProb = 0.2;
-        int visualizationInterval = 20;
-        int numThreads = 2;
-        
-        try {
-            // Crear y ejecutar simulación
-            ParallelSimulation simulation = new ParallelSimulation(
-                gridFile, 
-                numVehicles, 
-                trafficLightCycle, 
-                directionChangeProb, 
-                numThreads
-            );
+        int    visualizationInterval = 50;
 
-            long parStartTime = System.currentTimeMillis();
-            simulation.run(simulationSteps);
-            long parEndTime = System.currentTimeMillis();
+        try {
+            ParallelSimulation simulation = new ParallelSimulation(
+                gridFile, numVehicles, trafficLightCycle, directionChangeProb
+            );
 
             System.out.println("═══════════════════════════════════════════════════════════");
             System.out.println("   SIMULACIÓN BASADA EN AGENTES DE TRÁFICO URBANO          ");
             System.out.println("               Versión Paralela                            ");
             System.out.println("═══════════════════════════════════════════════════════════\n");
-            
+
             System.out.println("Configuración:");
-            System.out.println("  Archivo de rejilla: " + gridFile);
-            System.out.println("  Número de vehículos: " + numVehicles);
-            System.out.println("  Pasos de simulación: " + simulationSteps);
-            System.out.println("  Ciclo de semáforo: " + trafficLightCycle + " pasos");
-            System.out.println("  Probabilidad de cambio de dirección: " + (directionChangeProb * 100) + "%");
-            System.out.println("  Hilos utilizados: " + simulation.getNumThreads());
+            System.out.println("  Archivo de rejilla:               " + gridFile);
+            System.out.println("  Número de vehículos:              " + numVehicles);
+            System.out.println("  Pasos de simulación:              " + simulationSteps);
+            System.out.println("  Ciclo de semáforo:                " + trafficLightCycle + " pasos");
+            System.out.println("  Prob. cambio de dirección:        " + (directionChangeProb * 100) + "%");
+            System.out.println("  Hilos (cuadrantes):               " + ParallelSimulation.NUM_THREADS);
             System.out.println();
-            
-            
-            // Mostrar la rejilla inicial
+
             System.out.println("Rejilla urbana:");
             simulation.getGrid().print();
             System.out.println();
-            
-            // Ejecutar simulación con visualización
+
+            // Una sola ejecución con visualización
             simulation.runWithVisualization(simulationSteps, visualizationInterval);
-            
-            // Exportar datos para análisis
-            exportMetrics(simulation);
+
+            printMetrics(simulation);
             simulation.shutdown();
-            
+
         } catch (IOException e) {
             System.err.println("Error al cargar el archivo de rejilla: " + e.getMessage());
-            System.err.println("Asegúrese de que el archivo '" + gridFile + "' existe en el directorio actual.");
             System.exit(1);
         } catch (Exception e) {
             System.err.println("Error durante la simulación: " + e.getMessage());
@@ -67,27 +53,23 @@ public class Main {
             System.exit(1);
         }
     }
-    
-    /**
-     * Exporta métricas para análisis posterior
-     */
-    private static void exportMetrics(ParallelSimulation simulation) {
+
+    private static void printMetrics(ParallelSimulation sim) {
         System.out.println("\n═════════════════════════════════════════════════════════════");
         System.out.println("                    RESUMEN DE MÉTRICAS                        ");
         System.out.println("═════════════════════════════════════════════════════════════");
         System.out.println("\nMétricas del Sistema:");
-        System.out.println("  - Flujo promedio de vehículos: " + 
-            String.format("%.2f", simulation.getMetrics().getAverageFlow()));
-        System.out.println("  - Vehículos detenidos: " + 
-            simulation.getMetrics().getStoppedVehicles() + " / " + 
-            simulation.getMetrics().getTotalVehicles());
-        System.out.println("  - Porcentaje de congestión: " + 
-            String.format("%.2f%%", simulation.getMetrics().getStopPercentage()));
-        
+        System.out.printf("  - Flujo promedio de vehículos:  %.2f%n",
+                sim.getMetrics().getAverageFlow());
+        System.out.println("  - Vehículos detenidos:          " +
+                sim.getMetrics().getStoppedVehicles() + " / " +
+                sim.getMetrics().getTotalVehicles());
+        System.out.printf("  - Porcentaje de congestión:     %.2f%%%n",
+                sim.getMetrics().getStopPercentage());
         System.out.println("\nMétricas Computacionales:");
-        System.out.println("  - Tiempo de ejecución: " + 
-            simulation.getMetrics().getExecutionTimeMs() + " ms");
-        System.out.println("  - Movimientos totales: " + 
-            simulation.getMetrics().getTotalMoves());
+        System.out.println("  - Tiempo de ejecución:          " +
+                sim.getMetrics().getExecutionTimeMs() + " ms");
+        System.out.println("  - Movimientos totales:          " +
+                sim.getMetrics().getTotalMoves());
     }
 }
